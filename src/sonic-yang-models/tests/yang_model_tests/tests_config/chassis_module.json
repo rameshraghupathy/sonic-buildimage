@@ -13,11 +13,11 @@
                     },
                     {
                         "name": "DPU0",
-                        "admin_status": "up"
+                        "admin_status": "down"
                     },
                     {
                         "name": "DPU1",
-                        "admin_status": "up"
+                        "admin_status": "down"
                     },
                     {
                         "name": "FABRIC-CARD0",
