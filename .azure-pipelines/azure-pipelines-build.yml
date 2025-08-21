@@ -182,10 +182,6 @@ jobs:
               make  $BUILD_OPTIONS INSTALL_DEBUG_TOOLS=y target/sonic-$(GROUP_NAME).bin
               mv target/sonic-$(GROUP_NAME).bin target/sonic-$(GROUP_NAME)-dbg.bin
             fi
-            if [ $(ss_image) == yes ]; then
-              make $BUILD_OPTIONS target/sonic-$(GROUP_NAME).bin
-              mv target/sonic-$(GROUP_NAME).bin target/sonic-$(GROUP_NAME)-smartswitch.bin
-            fi
             if [ $(swi_image) == yes ]; then
               make $BUILD_OPTIONS ENABLE_IMAGE_SIGNATURE=y target/sonic-aboot-$(GROUP_NAME).swi
             fi
