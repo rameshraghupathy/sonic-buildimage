@@ -454,21 +454,73 @@ sudo LANG=C DEBIAN_FRONTEND=noninteractive chroot $FILESYSTEM_ROOT apt-get -y in
     chrony
 
 if [[ $TARGET_BOOTLOADER == grub ]]; then
-	sudo cp $debs_path/grub-common*.deb $debs_path/grub2-common*.deb $FILESYSTEM_ROOT
-	basename_deb_packages=$(basename -a $debs_path/grub-common*.deb $debs_path/grub2-common*.deb | sed 's,^,./,')
-	sudo LANG=C DEBIAN_FRONTEND=noninteractive chroot $FILESYSTEM_ROOT apt -y --allow-downgrades install $basename_deb_packages
-	sudo rm $FILESYSTEM_ROOT/grub-common*.deb $FILESYSTEM_ROOT/grub2-common*.deb
-	( cd $FILESYSTEM_ROOT; sudo rm -f $basename_deb_packages )
 
-    if [[ $CONFIGURED_ARCH == amd64 ]]; then
-        GRUB_PKGS='grub-efi-amd64-bin grub-pc-bin'
-    elif [[ $CONFIGURED_ARCH == arm64 ]]; then
-        GRUB_PKGS=grub-efi-arm64-bin
+    if [[ ${USE_DISTRO_GRUB:-n} == "y" ]]; then
+        echo "[INFO] Using distro GRUB packages; skipping SONiC custom GRUB packages"
+
+        #
+        # grub2-common was already installed from the configured Debian
+        # repository through $bootloader_packages above.
+        #
+        # The ONIE installer still needs the architecture-specific GRUB
+        # binary packages under platform/grub, so download the distro
+        # .deb files and preserve them in the same location used by the
+        # existing SONiC build.
+        #
+        if [[ $CONFIGURED_ARCH == amd64 ]]; then
+            GRUB_PKGS='grub-efi-amd64-bin grub-pc-bin'
+        elif [[ $CONFIGURED_ARCH == arm64 ]]; then
+            GRUB_PKGS='grub-efi-arm64-bin'
+        fi
+
+        for grub_pkg in $GRUB_PKGS; do
+            echo "[INFO] Downloading distro GRUB package: $grub_pkg"
+
+            sudo LANG=C DEBIAN_FRONTEND=noninteractive \
+                chroot $FILESYSTEM_ROOT \
+                bash -c "cd /tmp && apt-get download ${grub_pkg}"
+
+            sudo cp \
+                $FILESYSTEM_ROOT/tmp/${grub_pkg}_*.deb \
+                $FILESYSTEM_ROOT/$PLATFORM_DIR/grub/
+
+            sudo rm -f $FILESYSTEM_ROOT/tmp/${grub_pkg}_*.deb
+        done
+
+    else
+        #
+        # Existing SONiC behavior: install SONiC-built/patched GRUB.
+        #
+        sudo cp $debs_path/grub-common*.deb \
+                $debs_path/grub2-common*.deb \
+                $FILESYSTEM_ROOT
+
+        basename_deb_packages=$(basename -a \
+                $debs_path/grub-common*.deb \
+                $debs_path/grub2-common*.deb | sed 's,^,./,')
+
+        sudo LANG=C DEBIAN_FRONTEND=noninteractive \
+            chroot $FILESYSTEM_ROOT \
+            apt -y --allow-downgrades install $basename_deb_packages
+
+        sudo rm \
+            $FILESYSTEM_ROOT/grub-common*.deb \
+            $FILESYSTEM_ROOT/grub2-common*.deb
+
+        ( cd $FILESYSTEM_ROOT; sudo rm -f $basename_deb_packages )
+
+        if [[ $CONFIGURED_ARCH == amd64 ]]; then
+            GRUB_PKGS='grub-efi-amd64-bin grub-pc-bin'
+        elif [[ $CONFIGURED_ARCH == arm64 ]]; then
+            GRUB_PKGS='grub-efi-arm64-bin'
+        fi
+
+        for grub_pkg in $GRUB_PKGS; do
+            sudo cp \
+                $debs_path/${grub_pkg}*.deb \
+                $FILESYSTEM_ROOT/$PLATFORM_DIR/grub
+        done
     fi
-
-    for grub_pkg in $GRUB_PKGS; do
-       sudo cp $debs_path/${grub_pkg}*.deb $FILESYSTEM_ROOT/$PLATFORM_DIR/grub
-    done
 fi
 
 ## Disable kexec supported reboot which was installed by default
