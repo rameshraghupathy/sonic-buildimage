@@ -99,6 +99,30 @@ ifeq ($(J2_VER),)
 $(error Please install j2 (sudo pip install jinjanator))
 endif
 
+# Ensure PLATFORM_HW_SKU is given as input when SONIC_IMMUTABLE_FS option is
+# enabled
+ifeq ($(SONIC_IMMUTABLE_FS),y)
+
+ifeq ($(PLATFORM_HW_SKU),)
+$(error If immutable FS is enabled, PLATFORM_HW_SKU must be set to a valid platform.)
+endif
+
+endif # SONIC_IMMUTABLE_FS == y
+
+# When NO_SHIM is enabled, PLATFORM_HW_SKU is optional.
+# If set, only that platform's configs are generated; if unset, all platforms are generated.
+ifeq ($(NO_SHIM),y)
+
+ifneq ($(filter y, $(SONIC_IMMUTABLE_FS)),)
+$(error If shim is disabled, SONIC_IMMUTABLE_FS should not be set to y.)
+endif
+
+ifneq ($(filter y, $(ONIE_IMAGE_AB_PARTITION)),)
+$(error NO_SHIM=y and ONIE_IMAGE_AB_PARTITION=y are mutually exclusive. A/B partition support with NO_SHIM is not implemented.)
+endif
+
+endif # NO_SHIM == y
+
 # Check for minimum Docker version on build host
 # Note: Using the greater of CE (17.05.0) and EE (17.06.1) versions that support ARG before FROM
 docker_min := 17.06.1
@@ -391,6 +415,17 @@ ifneq ($(SECURE_UPGRADE_PROD_TOOL_ARGS),)
 	DOCKER_RUN += -e "SECURE_UPGRADE_PROD_TOOL_ARGS=$(SECURE_UPGRADE_PROD_TOOL_ARGS)"
 endif
 
+# Mount the detached signing prod tool in the slave container
+$(info "SECURE_UPGRADE_PROD_DETACHED_SIGNING_TOOL": "$(SECURE_UPGRADE_PROD_DETACHED_SIGNING_TOOL)")
+ifneq ($(SECURE_UPGRADE_PROD_DETACHED_SIGNING_TOOL),)
+	DOCKER_RUN += -v $(SECURE_UPGRADE_PROD_DETACHED_SIGNING_TOOL):/sonic/scripts/$(shell basename -- $(SECURE_UPGRADE_PROD_DETACHED_SIGNING_TOOL)):ro
+endif
+
+# Pass the detached Signing prod tool arguments as environment variable to avoid make command-line parsing issues
+ifneq ($(SECURE_UPGRADE_PROD_DETACHED_TOOL_ARGS),)
+	DOCKER_RUN += -e "SECURE_UPGRADE_PROD_DETACHED_TOOL_ARGS=$(SECURE_UPGRADE_PROD_DETACHED_TOOL_ARGS)"
+endif
+
 ifneq ($(SONIC_DPKG_CACHE_SOURCE),)
 	DOCKER_RUN += -v "$(SONIC_DPKG_CACHE_SOURCE):/dpkg_cache:rw"
 endif
@@ -636,6 +671,8 @@ SONIC_BUILD_INSTRUCTION :=  $(MAKE) \
                            SECURE_UPGRADE_SIGNING_CERT=$(SECURE_UPGRADE_SIGNING_CERT) \
                            SECURE_UPGRADE_KERNEL_CAFILE=$(SECURE_UPGRADE_KERNEL_CAFILE) \
                            SECURE_UPGRADE_PROD_SIGNING_TOOL=$(SECURE_UPGRADE_PROD_SIGNING_TOOL) \
+                           SECURE_UPGRADE_PROD_DETACHED_SIGNING_TOOL=$(SECURE_UPGRADE_PROD_DETACHED_SIGNING_TOOL) \
+                           SECURE_UPGRADE_PROD_DETACHED_TOOL_ARGS=$(SECURE_UPGRADE_PROD_DETACHED_TOOL_ARGS) \
                            SONIC_DEFAULT_CONTAINER_REGISTRY=$(DEFAULT_CONTAINER_REGISTRY) \
                            ENABLE_HOST_SERVICE_ON_START=$(ENABLE_HOST_SERVICE_ON_START) \
                            SLAVE_DIR=$(SLAVE_DIR) \
@@ -654,6 +691,10 @@ SONIC_BUILD_INSTRUCTION :=  $(MAKE) \
                            BUILD_SNAPSHOT_URL=$(BUILD_SNAPSHOT_URL) \
                            SONIC_VERSION_CONTROL_COMPONENTS=$(SONIC_VERSION_CONTROL_COMPONENTS) \
                            ONIE_IMAGE_PART_SIZE=$(ONIE_IMAGE_PART_SIZE) \
+                           NO_SHIM=$(NO_SHIM) \
+                           ONIE_IMAGE_AB_PARTITION=$(ONIE_IMAGE_AB_PARTITION) \
+                           SONIC_IMMUTABLE_FS=$(SONIC_IMMUTABLE_FS) \
+                           PLATFORM_HW_SKU=$(PLATFORM_HW_SKU) \
                            SONIC_OS_VERSION=$(SONIC_OS_VERSION) \
                            PIP_HTTP_TIMEOUT=$(PIP_HTTP_TIMEOUT) \
                            BUILD_PROCESS_TIMEOUT=$(BUILD_PROCESS_TIMEOUT) \

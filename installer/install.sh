@@ -103,6 +103,13 @@ ONIE_PLATFORM_EXTRA_CMDLINE_LINUX=""
 # after this.
 ONIE_IMAGE_PART_SIZE="%%ONIE_IMAGE_PART_SIZE%%"
 
+ONIE_IMAGE_AB_PARTITION="%%ONIE_IMAGE_AB_PARTITION%%"
+SONIC_IMMUTABLE_FS="%%SONIC_IMMUTABLE_FS%%"
+echo "A/B Partition: $ONIE_IMAGE_AB_PARTITION, Immutable FS: $SONIC_IMMUTABLE_FS"
+
+NO_SHIM="%%NO_SHIM%%"
+echo "NO_SHIM=$NO_SHIM"
+
 # Default var/log device size in MB
 VAR_LOG_SIZE=4096
 
@@ -259,7 +266,42 @@ fi
 echo "EXTRA_CMDLINE_LINUX=$extra_cmdline_linux"
 
 # Update Bootloader Menu with installed image
-bootloader_menu_config
+if [ "$NO_SHIM" = "y" ] && [ "$install_env" = "sonic" ]; then
+    # NO_SHIM sonic-to-sonic: skip legacy grub menu generation.
+    # The signed top-level grub.cfg and base_grub.cfg must not be replaced
+    # on upgrades — only on fresh ONIE installs (handled in default_platform.conf).
+    # Place the platform-specific leaf config at the canonical location so
+    # sonic-installer can read the menuentry name.
+    _plat_cfg="$demo_mnt/$image_dir/grub/platforms/$onie_platform"
+    if [ ! -d "$_plat_cfg" ] && [ -n "$onie_base_platform" ]; then
+        echo "Platform config not found for $onie_platform, falling back to base platform $onie_base_platform"
+        _plat_cfg="$demo_mnt/$image_dir/grub/platforms/$onie_base_platform"
+    fi
+    if [ ! -d "$_plat_cfg" ]; then
+        echo "ERROR: No NO_SHIM grub configs found for platform: $onie_platform (or base: $onie_base_platform)"
+        echo "Available platforms:"
+        ls "$demo_mnt/$image_dir/grub/platforms/" 2>/dev/null
+        exit 1
+    fi
+    cp "$_plat_cfg/image.cfg" "$demo_mnt/$image_dir/grub/image.cfg"
+    cp "$_plat_cfg/image.cfg.signature" "$demo_mnt/$image_dir/grub/image.cfg.signature"
+else
+    bootloader_menu_config
+fi
+
+# NO_SHIM dual-image: update grubenv with current/standby image directory
+# names so the top-level signed grub.cfg can chainload the correct leaf configs.
+if [ "$NO_SHIM" = "y" ] && [ "$ONIE_IMAGE_AB_PARTITION" != "y" ]; then
+    _grubenv="$demo_mnt/grub/grubenv"
+    if [ ! -f "$_grubenv" ]; then
+        grub-editenv "$_grubenv" create
+    fi
+    grub-editenv "$_grubenv" set current_image="$image_dir"
+    if [ "$install_env" = "sonic" ]; then
+        # The previously running image becomes standby
+        grub-editenv "$_grubenv" set standby_image="image-$running_sonic_revision"
+    fi
+fi
 
 # Set NOS mode if available.  For manufacturing diag installers, you
 # probably want to skip this step so that the system remains in ONIE

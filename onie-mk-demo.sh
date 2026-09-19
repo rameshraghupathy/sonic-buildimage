@@ -15,8 +15,11 @@ demo_type=$7
 image_version=$8
 onie_image_part_size=$9
 onie_installer_payload=${10}
-cert_file=${11}
-key_file=${12}
+onie_image_ab_partition=${11}
+sonic_immutable_fs=${12}
+cert_file=${13}
+key_file=${14}
+no_shim=${15}
 
 shift 9
 
@@ -102,6 +105,9 @@ sed -i -e "s/%%DEMO_TYPE%%/$demo_type/g" \
        -e "s/%%ONIE_IMAGE_PART_SIZE%%/$onie_image_part_size/" \
        -e "s/%%EXTRA_CMDLINE_LINUX%%/$EXTRA_CMDLINE_LINUX/" \
        -e "s@%%OUTPUT_RAW_IMAGE%%@$output_raw_image@" \
+       -e "s/%%ONIE_IMAGE_AB_PARTITION%%/$onie_image_ab_partition/" \
+       -e "s/%%SONIC_IMMUTABLE_FS%%/$sonic_immutable_fs/" \
+       -e "s@%%NO_SHIM%%@$no_shim@" \
     $tmp_installdir/install.sh || clean_up 1
 echo -n "."
 cp -r $onie_installer_payload $tmp_installdir || clean_up 1

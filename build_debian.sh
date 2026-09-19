@@ -59,6 +59,9 @@ if [ "$IMAGE_TYPE" = "aboot" ]; then
     TARGET_BOOTLOADER="aboot"
 fi
 
+# include ab_imfs specific build script
+. build_debian_ab_imfs.sh
+
 ## Check if not a last stage of RFS build
 if [[ $RFS_SPLIT_LAST_STAGE != y ]]; then
 
@@ -706,6 +709,9 @@ fi
 sudo LANG=C chroot $FILESYSTEM_ROOT /bin/bash -c "mkdir -p /etc/fips"
 sudo LANG=C chroot $FILESYSTEM_ROOT /bin/bash -c "echo 0 > /etc/fips/fips_enable"
 
+# Setup ab_imfs specific platform directories and packages
+setup_ab_imfs_platform_pkgs
+
 # #################
 #   secure boot
 # #################
@@ -713,9 +719,14 @@ if [[ $SECURE_UPGRADE_MODE == 'dev' || $SECURE_UPGRADE_MODE == "prod" ]]; then
     echo "Secure Boot support build stage: Starting .."
 
     # debian secure boot dependencies
-    sudo LANG=C DEBIAN_FRONTEND=noninteractive chroot $FILESYSTEM_ROOT apt-get -y install      \
-        shim-unsigned \
-        grub-efi
+    if [[ "$NO_SHIM" != "y" ]]; then
+        sudo LANG=C DEBIAN_FRONTEND=noninteractive chroot $FILESYSTEM_ROOT apt-get -y install      \
+            shim-unsigned \
+            grub-efi
+    else
+        sudo LANG=C DEBIAN_FRONTEND=noninteractive chroot $FILESYSTEM_ROOT apt-get -y install      \
+            grub-efi
+    fi
 
     if [ ! -f $SECURE_UPGRADE_SIGNING_CERT ]; then
         echo "Error: SONiC SECURE_UPGRADE_SIGNING_CERT=$SECURE_UPGRADE_SIGNING_CERT key missing"
@@ -762,8 +773,13 @@ if [[ $SECURE_UPGRADE_MODE == 'dev' || $SECURE_UPGRADE_MODE == "prod" ]]; then
     echo "Secure Boot support build stage: END."
 fi
 
+generate_and_setup_ab_imfs_certs
+
 ## Update initramfs
 sudo chroot $FILESYSTEM_ROOT update-initramfs -u
+INITRD_FILE=initrd.img-${LINUX_KERNEL_VERSION}-sonic-${CONFIGURED_ARCH}
+KERNEL_FILE=vmlinuz-${LINUX_KERNEL_VERSION}-sonic-${CONFIGURED_ARCH}
+
 ## Convert initrd image to u-boot format
 if [[ $TARGET_BOOTLOADER == uboot ]]; then
     INITRD_FILE=initrd.img-${LINUX_KERNEL_VERSION}-sonic-${CONFIGURED_ARCH}
@@ -830,6 +846,12 @@ if [[ $TARGET_BOOTLOADER == uboot ]]; then
     fi
 fi
 
+# Build final initRD during build time so that it does not
+# need to change and this can be signed if needed for secureboot
+# Get the appriopriate ACPI settings for this HWSKU and build
+# the final initrd
+generate_initrd_ab_imfs
+
 # Collect host image version files before cleanup
 SONIC_VERSION_CACHE=${SONIC_VERSION_CACHE}  \
 	DBGOPT="${DBGOPT}" \
@@ -871,6 +893,209 @@ sudo timeout 15s bash -c 'until LANG=C chroot $0 umount /proc; do sleep 1; done'
 
 ## Prepare empty directory to trigger mount move in initramfs-tools/mount_loop_root, implemented by patching
 sudo mkdir $FILESYSTEM_ROOT/host
+
+setup_ab_imfs_custom_dirs
+
+sudo mkdir -p $FILESYSTEM_ROOT/grub
+
+if [[ "$NO_SHIM" == "y" ]]; then
+    echo "Setting up prebuilt grub config for NO_SHIM"
+
+    # Universal base_grub.cfg (chainloads grub.cfg from SONiC-OS partition)
+    cat << EOF | sudo tee $FILESYSTEM_ROOT/grub/base_grub.cfg
+search --no-floppy --label --set=root SONiC-OS
+set prefix=(\$root)'/grub'
+configfile \$prefix/grub.cfg
+EOF
+
+    # Populate installer/platforms/ from device/ directories (build_image.sh
+    # does this later but we need the files now for grub config generation).
+    # Platforms without installer.conf still get a placeholder so they are
+    # considered as NO_SHIM candidates (the ACPI CPIO check below is the
+    # real gating condition).
+    mkdir -p installer/platforms/
+    for _vendor in $(ls device/); do
+        for _plat in $(ls device/$_vendor/ 2>/dev/null | grep "^x86_64"); do
+            if [ -f "device/$_vendor/$_plat/installer.conf" ]; then
+                cp "device/$_vendor/$_plat/installer.conf" "installer/platforms/$_plat"
+            else
+                touch "installer/platforms/$_plat"
+            fi
+            echo "SONIC_IMMUTABLE_FS=\"$SONIC_IMMUTABLE_FS\"" >> "installer/platforms/$_plat"
+        done
+    done
+
+    # Determine which platforms to generate configs for
+    if [ -n "$PLATFORM_HW_SKU" ]; then
+        # Legacy single-platform mode: generate only for the specified platform
+        noshim_platforms="$PLATFORM_HW_SKU"
+    else
+        # Bridge BSP naming inconsistency: some ACPI CPIOs use hyphens (e.g.
+        # N9K-C93108TC-FX3.cpio) while platform.conf cases use underscores
+        # (N9K_C93108TC_FX3.cpio).  Create underscore symlinks so both resolve.
+        if [ -d "$FILESYSTEM_ROOT/$PLATFORM_DIR/acpi" ]; then
+            for _cpio in $FILESYSTEM_ROOT/$PLATFORM_DIR/acpi/*.cpio; do
+                [ -f "$_cpio" ] || continue
+                _base=$(basename "$_cpio")
+                _underscore=$(echo "$_base" | tr '-' '_')
+                if [ "$_underscore" != "$_base" ] && [ ! -e "$FILESYSTEM_ROOT/$PLATFORM_DIR/acpi/$_underscore" ]; then
+                    sudo ln -s "$_base" "$FILESYSTEM_ROOT/$PLATFORM_DIR/acpi/$_underscore"
+                fi
+            done
+        fi
+
+        # Multi-platform mode: generate for all platforms in installer/platforms/
+        # that have a matching ACPI CPIO for this target machine (skips non-cisco platforms)
+        noshim_platforms=$(ls installer/platforms/ 2>/dev/null | while read p; do
+            cpio=$(onie_platform="$p" ACPI_CPIO=.cpio bash -c \
+                '. platform/'"$TARGET_MACHINE"'/platform.conf >/dev/null 2>&1; echo "$ACPI_CPIO"')
+            [ -f "$FILESYSTEM_ROOT/$PLATFORM_DIR/acpi/$cpio" ] && echo "$p" || true
+        done)
+    fi
+
+    if [ -z "$noshim_platforms" ]; then
+        echo "ERROR: No NO_SHIM platforms found with a matching ACPI CPIO."
+        echo "Ensure PLATFORM_HW_SKU is set, or that installer/platforms/ is populated"
+        echo "and each platform has a corresponding ACPI CPIO in $FILESYSTEM_ROOT/$PLATFORM_DIR/acpi/."
+        exit 1
+    fi
+
+    # Copy ACPI CPIOs to boot/acpi/ for inclusion in installer payload
+    sudo mkdir -p $FILESYSTEM_ROOT/boot/acpi
+    if [ -d $FILESYSTEM_ROOT/$PLATFORM_DIR/acpi ]; then
+        sudo cp -a $FILESYSTEM_ROOT/$PLATFORM_DIR/acpi/*.cpio $FILESYSTEM_ROOT/boot/acpi/ 2>/dev/null || true
+    fi
+
+    # Generate per-platform grub configs
+    for plat_name in $noshim_platforms; do
+        echo "Generating NO_SHIM grub configs for platform: $plat_name"
+
+        # Reset per-platform variables
+        CONSOLE_DEV=0
+        CONSOLE_PORT=0x3f8
+        CONSOLE_SPEED=115200
+        VAR_LOG_SIZE=4096
+        ONIE_PLATFORM_EXTRA_CMDLINE_LINUX=""
+
+        # Source platform-specific values from installer/platforms/
+        if [ -r "installer/platforms/$plat_name" ]; then
+            . "installer/platforms/$plat_name"
+        fi
+
+        # Also source from device dir if available (for overrides)
+        vendor_dir=$PLATFORM_DIR/$CONFIGURED_PLATFORM
+        device_dir=device/$plat_name
+        [[ -r $vendor_dir/$device_dir/installer.conf ]] && . $vendor_dir/$device_dir/installer.conf
+
+        # Apply defaults for anything not set
+        CONSOLE_DEV=${CONSOLE_DEV:-0}
+        CONSOLE_PORT=${CONSOLE_PORT:-0x3f8}
+        CONSOLE_SPEED=${CONSOLE_SPEED:-115200}
+        VAR_LOG_SIZE=${VAR_LOG_SIZE:-4096}
+
+        # Resolve ACPI CPIO filename for this platform via platform.conf
+        PLAT_ACPI_CPIO=$(onie_platform="$plat_name" ACPI_CPIO=.cpio \
+            bash -c '. platform/'"$TARGET_MACHINE"'/platform.conf >/dev/null 2>&1; echo "$ACPI_CPIO"')
+
+        # Validate the CPIO exists before emitting image.cfg — catches a bad
+        # PLATFORM_HW_SKU or missing ACPI table early rather than producing a
+        # signed installer that silently fails at GRUB when loading the initrd.
+        if [ ! -f "$FILESYSTEM_ROOT/boot/acpi/$PLAT_ACPI_CPIO" ]; then
+            echo "ERROR: ACPI CPIO '$PLAT_ACPI_CPIO' not found for platform '$plat_name'" \
+                 "in $FILESYSTEM_ROOT/boot/acpi/"
+            exit 1
+        fi
+
+        sudo mkdir -p $FILESYSTEM_ROOT/grub/platforms/$plat_name
+
+        # Per-platform top_level_grub.cfg (varies by serial speed)
+        cat << EOF | sudo tee $FILESYSTEM_ROOT/grub/platforms/$plat_name/top_level_grub.cfg
+# GRUB_BOOT_MODE=noshim-signed
+serial --port=$CONSOLE_PORT --speed=$CONSOLE_SPEED --word=8 --parity=no --stop=1
+terminal_input console serial
+terminal_output console serial
+set timeout=5
+if [ -s \$prefix/grubenv ]; then
+    load_env
+fi
+if [ "\${saved_entry}" ]; then
+    set default="\${saved_entry}"
+fi
+if [ "\${next_entry}" ]; then
+    set default="\${next_entry}"
+    unset next_entry
+    save_env next_entry
+fi
+if [ "\${onie_entry}" ]; then
+    set next_entry="\${default}"
+    set default="\${onie_entry}"
+    unset onie_entry
+    save_env onie_entry next_entry
+fi
+
+# Slot 0: current image — source its pre-signed leaf config
+if [ -n "\${current_image}" ]; then
+    if [ -f (\$root)/\${current_image}/grub/image.cfg ]; then
+        source (\$root)/\${current_image}/grub/image.cfg
+    fi
+fi
+
+# Slot 1: standby image — source its pre-signed leaf config
+if [ -n "\${standby_image}" ]; then
+    if [ -f (\$root)/\${standby_image}/grub/image.cfg ]; then
+        source (\$root)/\${standby_image}/grub/image.cfg
+    fi
+fi
+
+# ONIE recovery (always available)
+menuentry ONIE {
+        set root='(hd0,gpt1)'
+        search --no-floppy --label --set=root 'EFI System'
+        echo    'Loading ONIE ...'
+        chainloader /EFI/onie/grubx64.efi
+}
+EOF
+
+        # Per-platform image.cfg with platform-specific cmdline and ACPI CPIO
+        cat << EOF | sudo tee $FILESYSTEM_ROOT/grub/platforms/$plat_name/image.cfg
+menuentry 'SONiC-OS-$build_version' {
+        search --no-floppy --label --set=root SONiC-OS
+        echo 'Loading SONiC-OS OS kernel ...'
+        insmod gzio
+        if [ x = xxen ]; then insmod xzio; insmod lzopio; fi
+        insmod part_msdos
+        insmod ext2
+        linuxefi /image-$build_version/boot/$KERNEL_FILE root=LABEL=SONiC-OS rw console=tty$CONSOLE_DEV console=ttyS${CONSOLE_DEV},${CONSOLE_SPEED}n8 quiet processor.max_cstate=1 intel_idle.max_cstate=0 net.ifnames=0 biosdevname=0 loop=image-$build_version/fs.squashfs loopfstype=squashfs systemd.unified_cgroup_hierarchy=0 apparmor=1 security=apparmor varlog_size=$VAR_LOG_SIZE usbcore.autosuspend=-1 $ONIE_PLATFORM_EXTRA_CMDLINE_LINUX
+        echo 'Loading SONiC-OS OS initial ramdisk ...'
+        initrdefi /image-$build_version/boot/acpi/$PLAT_ACPI_CPIO /image-$build_version/boot/$INITRD_FILE
+}
+EOF
+    done
+
+fi # NO_SHIM == y
+
+if [[ "$SONIC_IMMUTABLE_FS" == "y" || "$NO_SHIM" == "y" ]]; then
+    # Create detached signatures for all grub cfg files
+    if [[ "$SECURE_UPGRADE_MODE" == "prod" ]]; then
+        if [[ "$NO_SHIM" == "y" ]]; then
+            # base_grub.cfg is only created in the NO_SHIM block above
+            sudo -E $sonic_su_prod_detached_signing_tool $SECURE_UPGRADE_PROD_DETACHED_TOOL_ARGS \
+                $FILESYSTEM_ROOT/grub/base_grub.cfg
+            # Sign per-platform configs
+            find $FILESYSTEM_ROOT/grub/platforms -name "*.cfg" -exec \
+                sudo -E $sonic_su_prod_detached_signing_tool $SECURE_UPGRADE_PROD_DETACHED_TOOL_ARGS {} +
+            # Sign ACPI CPIOs
+            if ls $FILESYSTEM_ROOT/boot/acpi/*.cpio 1>/dev/null 2>&1; then
+                sudo -E $sonic_su_prod_detached_signing_tool $SECURE_UPGRADE_PROD_DETACHED_TOOL_ARGS \
+                    $FILESYSTEM_ROOT/boot/acpi/*.cpio
+            fi
+        fi
+        if [[ "$SONIC_IMMUTABLE_FS" == "y" ]]; then
+            sudo -E $sonic_su_prod_detached_signing_tool $SECURE_UPGRADE_PROD_DETACHED_TOOL_ARGS \
+                $FILESYSTEM_ROOT/grub/*.cfg
+        fi
+    fi
+fi # SONIC_IMMUTABLE_FS == y OR NO_SHIM == y
 
 
 if [[ "$CHANGE_DEFAULT_PASSWORD" == "y" ]]; then
@@ -942,5 +1167,9 @@ else
 fi
 
 ## Compress together with /boot, /var/lib/docker and $PLATFORM_DIR as an installer payload zip file
-pushd $FILESYSTEM_ROOT && sudo tar -I pigz -cf platform.tar.gz -C $PLATFORM_DIR . && sudo zip -n .gz $OLDPWD/$INSTALLER_PAYLOAD -r boot/ platform.tar.gz; popd
+generate_ab_imfs_shafiles
+
+## Add /grub to the payload when NO_SHIM=y
+EXTRA_ZIP=$([[ "$NO_SHIM" == "y" ]] && echo "grub/" || true)
+pushd $FILESYSTEM_ROOT && sudo tar -I pigz -cf platform.tar.gz -C $PLATFORM_DIR . && sudo zip -n .gz $OLDPWD/$INSTALLER_PAYLOAD -r boot/ $EXTRA_ZIP platform.tar.gz; popd
 sudo zip -g -n .squashfs:.gz $INSTALLER_PAYLOAD $FILESYSTEM_SQUASHFS $FILESYSTEM_DOCKERFS
