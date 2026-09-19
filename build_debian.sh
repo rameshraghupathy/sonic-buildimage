@@ -1094,6 +1094,52 @@ if [[ "$SONIC_IMMUTABLE_FS" == "y" || "$NO_SHIM" == "y" ]]; then
             sudo -E $sonic_su_prod_detached_signing_tool $SECURE_UPGRADE_PROD_DETACHED_TOOL_ARGS \
                 $FILESYSTEM_ROOT/grub/*.cfg
         fi
+    elif [[ "$SECURE_UPGRADE_MODE" == "dev" ]]; then
+
+        dev_detached_sign()
+        {
+            local f
+
+            for f in "$@"; do
+                echo "Secure Boot DEV: creating detached CMS signature for $f"
+
+                sudo openssl cms \
+                    -sign \
+                    -binary \
+                    -in "$f" \
+                    -signer "$SECURE_UPGRADE_SIGNING_CERT" \
+                    -inkey "$SECURE_UPGRADE_DEV_SIGNING_KEY" \
+                    -md sha512 \
+                    -outform DER \
+                    -out "${f}.signature"
+
+                sudo openssl cms \
+                    -verify \
+                    -binary \
+                    -md sha512 \
+                    -in "${f}.signature" \
+                    -noverify \
+                    -content "$f" \
+                    -inform DER \
+                    >/dev/null
+            done
+        }
+
+        if [[ "$NO_SHIM" == "y" ]]; then
+            dev_detached_sign \
+                "$FILESYSTEM_ROOT/grub/base_grub.cfg"
+
+            while IFS= read -r cfg; do
+                dev_detached_sign "$cfg"
+            done < <(
+                find "$FILESYSTEM_ROOT/grub/platforms" \
+                     -type f -name "*.cfg" -print
+            )
+
+            if compgen -G "$FILESYSTEM_ROOT/boot/acpi/*.cpio" >/dev/null; then
+                dev_detached_sign "$FILESYSTEM_ROOT"/boot/acpi/*.cpio
+            fi
+        fi
     fi
 fi # SONIC_IMMUTABLE_FS == y OR NO_SHIM == y
 
